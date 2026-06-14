@@ -414,9 +414,14 @@ class MixedCalculator(LinearCombinationCalculator):
                 try:
                     bias_calc.calculate(atoms, properties, system_changes)
                 except Exception as e:
+                    # Fail loud: a bias-calculator error must NOT be silently
+                    # swallowed into a base-only (lambda=0) result, which would
+                    # masquerade as a valid biased run and corrupt any
+                    # bias-vs-control comparison. Matches the base-calculator
+                    # path, which also re-raises.
                     if self.rank == 0:
                         print(f"Error in bias calculator: {e}", flush=True)
-                    need_bias = False
+                    raise
             if self.parallel:
                 self.comm.Barrier()
 
