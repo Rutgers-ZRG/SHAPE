@@ -142,7 +142,7 @@ class MixedCalculator(LinearCombinationCalculator):
 
     def __init__(self, calc1, calc2, iter_max=None, comm=None, scheme='cosine',
                  mode='transition', adaptive_lambda=False, eta=0.3,
-                 max_f_bias_rms=50.0):
+                 max_f_bias_rms=50.0, mix_stress=True, max_s_bias_rms=5.0):
         """
         Parameters
         ----------
@@ -164,6 +164,14 @@ class MixedCalculator(LinearCombinationCalculator):
             Force-scale ratio for adaptive λ (default 0.3).
         max_f_bias_rms : float
             Safety clamp for bias forces (eV/Å, default 50.0).
+        mix_stress : bool
+            If True (bias mode), the cell is driven by σ = σ1 + λ_σ·σ2 so the
+            fingerprint stress influences cell relaxation (FrechetCellFilter),
+            not just atomic positions. λ_σ uses the same schedule and (when
+            adaptive_lambda) the same η, scaled to the base-stress magnitude.
+            Set False to keep the legacy behavior (stress from calc1 only).
+        max_s_bias_rms : float
+            Safety clamp for bias stress (eV/Å³, default 5.0 ≈ 800 GPa).
         """
         self.iter = 0
         self._last_positions = None
@@ -185,6 +193,8 @@ class MixedCalculator(LinearCombinationCalculator):
         self.mode = mode
         self.adaptive_lambda = adaptive_lambda
         self.eta = eta
+        self.mix_stress = mix_stress
+        self.max_s_bias_rms = max_s_bias_rms
         self.max_f_bias_rms = max_f_bias_rms
 
         # Store MPI communicator if provided
@@ -465,12 +475,37 @@ class MixedCalculator(LinearCombinationCalculator):
                 if need_bias else np.zeros((len(atoms), 3), dtype=float)
             )
 
-        # Stress: from base only (bias stress not mixed — same as CAWR)
+        # Stress: σ_base + λ_σ · σ_bias when mix_stress (lets the fingerprint
+        # drive the cell during the biased phase, mirroring the force bias;
+        # λ_σ uses the same schedule, scaled adaptively to the base-stress
+        # magnitude, and anneals to 0). Legacy behavior (stress from base
+        # only) when mix_stress is False.
         if 'stress' in properties:
-            self.results['stress'] = base_calc.results.get(
-                'stress', np.zeros(6, dtype=float))
+            s_base = base_calc.results.get('stress', np.zeros(6, dtype=float))
+            if self.mix_stress and need_bias and 'stress' in bias_calc.results:
+                s_bias = bias_calc.results['stress'].copy()
+
+                # Safety clamp
+                s_bias_rms = np.sqrt(np.mean(s_bias ** 2)) + 1e-30
+                if s_bias_rms > self.max_s_bias_rms:
+                    s_bias *= self.max_s_bias_rms / s_bias_rms
+                    s_bias_rms = self.max_s_bias_rms
+
+                # Compute λ_σ
+                if self.adaptive_lambda:
+                    s_base_rms = np.sqrt(np.mean(s_base ** 2)) + 1e-30
+                    lam_s = self.eta * s_base_rms / s_bias_rms * bias_schedule
+                else:
+                    lam_s = bias_schedule
+
+                self.results['stress'] = s_base + lam_s * s_bias
+                self.results['lambda_stress'] = lam_s
+            else:
+                self.results['stress'] = s_base
+                self.results['lambda_stress'] = 0.0
+
             self.results['stress_contributions'] = (
-                base_calc.results.get('stress', np.zeros(6, dtype=float)),
+                s_base,
                 bias_calc.results.get('stress', np.zeros(6, dtype=float))
                 if need_bias else np.zeros(6, dtype=float)
             )

@@ -49,6 +49,13 @@ H_TOL = 0.005            # eV/atom enthalpy window for "success"
 FP_CUTOFF, FP_NX = 4.0, 128
 FMAX, STEPS = 0.005, 2000
 ETA = 0.3                # adaptive-lambda force-scale ratio
+# arms:
+#   normal       plain MatterSim
+#   reform/cawr  MatterSim + fingerprint bias (K=1 / annealed-K), stress mixed
+#                so the fingerprint drives the cell too (mix_stress=True)
+#   *_pure       potential-free fingerprint relaxation (torch forces+stress),
+#                then scored by a MatterSim single point on the relaxed cell
+ARMS = ('normal', 'reform', 'cawr', 'reform_pure', 'cawr_pure')
 
 
 # ── shared helpers ───────────────────────────────────────────────────
@@ -126,20 +133,28 @@ def relax(atoms, arm, pressure, steps=STEPS, fmax=FMAX, refresh_every=10):
         a.calc = make_mattersim()
         return a, int(opt.nsteps), {}
 
-    from reformpy.mixing import MixedCalculator
     from reformpy.cawr_calculator import CAWRCalculator
     cawr = CAWRCalculator(cutoff=FP_CUTOFF, nx=FP_NX, backend='torch')
-    mixed = MixedCalculator(make_mattersim(), cawr, iter_max=steps,
-                            scheme='cosine', mode='bias',
-                            adaptive_lambda=True, eta=ETA)
-    a.calc = mixed
+    annealed = arm in ('cawr', 'cawr_pure')
+    pure = arm.endswith('_pure')
+
+    if pure:
+        # potential-free: fingerprint drives positions AND cell via torch
+        # autograd forces+stress. Scored later by a MatterSim single point.
+        a.calc = cawr
+    else:
+        from reformpy.mixing import MixedCalculator
+        mixed = MixedCalculator(make_mattersim(), cawr, iter_max=steps,
+                                scheme='cosine', mode='bias',
+                                adaptive_lambda=True, eta=ETA, mix_stress=True)
+        a.calc = mixed
     opt = FIRE(FrechetCellFilter(a, scalar_pressure=pressure * GPa),
                logfile=None)
 
-    if arm == 'cawr':
+    if annealed:
         # annealed-K discovery: at each round boundary exhaust statically
-        # justified split/merge proposals, then invalidate the wrapper cache
-        # if labels committed (the force law changed without atoms moving).
+        # justified split/merge proposals. refresh_labels clears the CAWR
+        # cache on commit; for the bias arm also reset the wrapper cache.
         def refresh():
             if opt.nsteps == 0 or opt.nsteps % refresh_every:
                 return
@@ -150,14 +165,14 @@ def relax(atoms, arm, pressure, steps=STEPS, fmax=FMAX, refresh_every=10):
                     committed = True
                 if not (cawr.state.has_pending or cawr.state.last_committed):
                     break
-            if committed:
+            if committed and not pure:
                 mixed.reset()
         opt.attach(refresh)
-    # arm == 'reform': no refresh -> K stays 1 (single-environment reform)
+    # reform / reform_pure: no refresh -> K stays 1 (single-environment)
 
     opt.run(fmax=fmax, steps=steps)
     K = cawr.state.K_per_element() if cawr.state is not None else {}
-    a.calc = make_mattersim()
+    a.calc = make_mattersim()                     # physical scoring
     return a, int(opt.nsteps), K
 
 
@@ -243,7 +258,7 @@ def mode_run(args):
     row = {'system': args.system, 'idx': args.idx,
            'gen_sg': int(atoms.info.get('gen_sg', -1))}
     t0 = time.time()
-    for arm in ('normal', 'reform', 'cawr'):
+    for arm in ARMS:
         relaxed, nsteps, K = relax(atoms, arm, s['pressure'],
                                    steps=args.steps, fmax=args.fmax)
         sc = _score(relaxed, h_ref, s['pressure'], s['target_sg'], ref_relaxed)
@@ -257,9 +272,8 @@ def mode_run(args):
         json.dump(row, f, indent=1, default=lambda o: o.item()
                   if hasattr(o, 'item') else str(o))
     print(f"[{args.system} #{args.idx}] "
-          + "  ".join(f"{a}: dH={row[a]['dH_meV']:.0f} "
-                      f"sg={row[a]['target_sg_found']} S={row[a]['success']}"
-                      for a in ('normal', 'reform', 'cawr'))
+          + "  ".join(f"{a}: dH={row[a]['dH_meV']:.0f} S={row[a]['success']}"
+                      for a in ARMS)
           + f"  K={row['cawr']['K_final']}  ({row['wall_s']}s)", flush=True)
 
 
@@ -273,18 +287,17 @@ def mode_aggregate(args):
     summary = {}
     for sysname, rs in sorted(by_sys.items()):
         arms = {}
-        for arm in ('normal', 'reform', 'cawr'):
+        for arm in ARMS:
             ok = sum(r[arm]['success'] for r in rs)
             tgt = sum(r[arm]['target_sg_found'] for r in rs)
             dh = [r[arm]['dH_meV'] for r in rs]
             arms[arm] = {'success': ok, 'target_sg_found': tgt,
                          'dH_median_meV': float(np.median(dh)),
                          'dH_min_meV': float(np.min(dh))}
-        # head-to-head dH (cawr vs reform vs normal), min over arms per struct
-        wins = {a: 0 for a in ('normal', 'reform', 'cawr')}
+        # which arm reaches the lowest dH per structure
+        wins = {a: 0 for a in ARMS}
         for r in rs:
-            best = min(('normal', 'reform', 'cawr'),
-                       key=lambda a: r[a]['dH_meV'])
+            best = min(ARMS, key=lambda a: r[a]['dH_meV'])
             wins[best] += 1
         summary[sysname] = {'n': len(rs), 'role': SYSTEMS[sysname]['role'],
                             'arms': arms, 'lowest_dH_arm_counts': wins}

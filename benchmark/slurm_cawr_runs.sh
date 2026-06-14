@@ -9,7 +9,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
-#SBATCH --time=02:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/scratch/lz432/cawr_campaign/logs/run_%x_%A_%a.out
 set -e
 ulimit -l unlimited 2>/dev/null || true          # let unused MPI auto-init succeed
