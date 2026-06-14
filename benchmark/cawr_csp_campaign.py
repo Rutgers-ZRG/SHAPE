@@ -139,17 +139,21 @@ def relax(atoms, arm, pressure, steps=STEPS, fmax=FMAX, refresh_every=10):
     pure = arm.endswith('_pure')
 
     if pure:
-        # potential-free: fingerprint drives positions AND cell via torch
-        # autograd forces+stress. Scored later by a MatterSim single point.
+        # Potential-free FP has no repulsive core / equation-of-state, so a
+        # VARIABLE cell collapses (V/atom -> ~0, atoms overlap -> LAPACK
+        # crash). Relax POSITIONS ONLY in the fixed cell: the fingerprint
+        # organizes atoms toward uniform environments (well-posed, converges
+        # fast). It cannot optimize the cell — that needs a physical PES.
         a.calc = cawr
+        opt = FIRE(a, logfile=None)
     else:
         from reformpy.mixing import MixedCalculator
         mixed = MixedCalculator(make_mattersim(), cawr, iter_max=steps,
                                 scheme='cosine', mode='bias',
                                 adaptive_lambda=True, eta=ETA, mix_stress=True)
         a.calc = mixed
-    opt = FIRE(FrechetCellFilter(a, scalar_pressure=pressure * GPa),
-               logfile=None)
+        opt = FIRE(FrechetCellFilter(a, scalar_pressure=pressure * GPa),
+                   logfile=None)
 
     if annealed:
         # annealed-K discovery: at each round boundary exhaust statically
@@ -259,11 +263,21 @@ def mode_run(args):
            'gen_sg': int(atoms.info.get('gen_sg', -1))}
     t0 = time.time()
     for arm in ARMS:
-        relaxed, nsteps, K = relax(atoms, arm, s['pressure'],
-                                   steps=args.steps, fmax=args.fmax)
-        sc = _score(relaxed, h_ref, s['pressure'], s['target_sg'], ref_relaxed)
-        sc['nsteps'] = nsteps
-        sc['K_final'] = {str(k): v for k, v in K.items()}
+        try:
+            relaxed, nsteps, K = relax(atoms, arm, s['pressure'],
+                                       steps=args.steps, fmax=args.fmax)
+            sc = _score(relaxed, h_ref, s['pressure'], s['target_sg'],
+                        ref_relaxed)
+            sc['nsteps'] = nsteps
+            sc['K_final'] = {str(k): v for k, v in K.items()}
+        except Exception as ex:
+            # One arm failing on a pathological geometry must not lose the
+            # whole structure's results. Record the error and continue.
+            sc = {'error': f"{type(ex).__name__}: {str(ex)[:120]}",
+                  'success': False, 'target_sg_found': False,
+                  'dH_meV': float('inf'), 'H_per_atom': None,
+                  'fp_dist_to_ref': float('nan'), 'sg_sweep': {},
+                  'nsteps': -1, 'K_final': {}}
         row[arm] = sc
     row['wall_s'] = round(time.time() - t0, 1)
 
@@ -290,15 +304,18 @@ def mode_aggregate(args):
         for arm in ARMS:
             ok = sum(r[arm]['success'] for r in rs)
             tgt = sum(r[arm]['target_sg_found'] for r in rs)
-            dh = [r[arm]['dH_meV'] for r in rs]
-            arms[arm] = {'success': ok, 'target_sg_found': tgt,
-                         'dH_median_meV': float(np.median(dh)),
-                         'dH_min_meV': float(np.min(dh))}
-        # which arm reaches the lowest dH per structure
+            errs = sum('error' in r[arm] for r in rs)
+            dh = [r[arm]['dH_meV'] for r in rs
+                  if np.isfinite(r[arm]['dH_meV'])]
+            arms[arm] = {'success': ok, 'target_sg_found': tgt, 'errors': errs,
+                         'dH_median_meV': float(np.median(dh)) if dh else None,
+                         'dH_min_meV': float(np.min(dh)) if dh else None}
+        # which arm reaches the lowest dH per structure (finite only)
         wins = {a: 0 for a in ARMS}
         for r in rs:
             best = min(ARMS, key=lambda a: r[a]['dH_meV'])
-            wins[best] += 1
+            if np.isfinite(r[best]['dH_meV']):
+                wins[best] += 1
         summary[sysname] = {'n': len(rs), 'role': SYSTEMS[sysname]['role'],
                             'arms': arms, 'lowest_dH_arm_counts': wins}
     out = {'config': {'steps': STEPS, 'fmax': FMAX, 'H_tol_eV': H_TOL,

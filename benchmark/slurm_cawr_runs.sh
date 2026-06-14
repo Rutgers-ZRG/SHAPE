@@ -8,7 +8,7 @@
 #SBATCH --array=0-299%25
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=4G
+#SBATCH --mem=8G
 #SBATCH --time=04:00:00
 #SBATCH --output=/scratch/lz432/cawr_campaign/logs/run_%x_%A_%a.out
 set -e
